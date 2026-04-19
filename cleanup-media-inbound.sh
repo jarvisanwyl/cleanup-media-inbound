@@ -1,41 +1,55 @@
-Check this bash script for bugs. The intention is to delete audio files older than x days
-
 #!/usr/bin/env bash
-# Cleanup media inbox - delete files older than 2 days
-# Usage: cleanup-media-inbound.sh [--dry-run] [--days X] [--folder /path/to/media]
+# cleanup-media-inbound
+#
+# Safely delete media files older than X days.
+# Supports dry-run, locking, robust filenames, and summary output.
 
 set -euo pipefail
 
-usage() {
-  cat >&2 <<'EOF'
-Delete media files older than specified days from the OpenClaw media inbox.
-
-Usage:
-  cleanup-media-inbound.sh [--dry-run] [--days X] [--folder /path]
-
-Options:
-  --dry-run    Show what would be deleted without removing files
-  --days X     Delete files older than X days (default: 2)
-  --folder     Specify custom folder (default: OpenClaw media inbox)
-  --help       Show this help
-
-Example:
-  cleanup-media-inbound.sh --days 7 --dry-run
-
-Notes:
-  - Only .ogg, .mp3, .wav, .mp4, .mov, .png, .jpg, .jpeg, .pdf files are checked
-  - Current user files are preserved (read/write checks)
-  - Files are matched by modification time, not creation time
-EOF
-  exit 2
-}
-
-# Default values
+#######################################
+# Defaults
+#######################################
 DRY_RUN=false
 DAYS=2
 MEDIA_INBOX="${OPENCLAW_MEDIA_INBOX:-/home/janwyl/.openclaw/media/inbound}"
+LOCK_FILE="/tmp/cleanup-media-inbound.lock"
 
+MATCHED=0
+DELETED=0
+FAILED=0
+
+#######################################
+# Usage
+#######################################
+usage() {
+cat <<EOF
+Usage:
+  cleanup-media-inbound [options]
+
+Options:
+  --dry-run         Show what would be deleted
+  --days N          Delete files older than N days (default: 2)
+  --folder PATH     Folder to clean
+  --help            Show help
+
+Examples:
+  cleanup-media-inbound --dry-run
+  cleanup-media-inbound --days 7
+  cleanup-media-inbound --folder /tmp/uploads
+EOF
+exit 2
+}
+
+#######################################
+# Logging
+#######################################
+log() {
+  printf '[%s] %s\n' "$(date '+%F %T')" "$*"
+}
+
+#######################################
 # Parse arguments
+#######################################
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run)
@@ -43,10 +57,12 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --days)
+      [[ $# -ge 2 ]] || { echo "Missing value for --days" >&2; exit 2; }
       DAYS="$2"
       shift 2
       ;;
     --folder)
+      [[ $# -ge 2 ]] || { echo "Missing value for --folder" >&2; exit 2; }
       MEDIA_INBOX="$2"
       shift 2
       ;;
@@ -54,57 +70,95 @@ while [[ $# -gt 0 ]]; do
       usage
       ;;
     *)
-      echo "Unknown arg: $1" >&2
+      echo "Unknown argument: $1" >&2
       usage
       ;;
   esac
 done
 
-# Validate path
-if [[ ! -d "$MEDIA_INBOX" ]]; then
-  echo "Error: Folder not found: $MEDIA_INBOX" >&2
+#######################################
+# Validation
+#######################################
+[[ "$DAYS" =~ ^[0-9]+$ ]] || {
+  echo "--days must be a non-negative integer" >&2
+  exit 2
+}
+
+[[ -d "$MEDIA_INBOX" ]] || {
+  echo "Folder not found: $MEDIA_INBOX" >&2
+  exit 1
+}
+
+#######################################
+# Prevent concurrent runs
+#######################################
+exec 9>"$LOCK_FILE"
+
+if ! flock -n 9; then
+  echo "Another cleanup process is already running." >&2
   exit 1
 fi
 
-# Count files before cleanup
-if [[ "$DRY_RUN" = true ]]; then
+#######################################
+# Start
+#######################################
+if [[ "$DRY_RUN" == true ]]; then
   echo "=== DRY RUN MODE ==="
-  echo "Would delete files older than $DAYS days from: $MEDIA_INBOX"
-  echo ""
+  echo "Would delete files older than $DAYS day(s) from: $MEDIA_INBOX"
+  echo
 fi
-
-# Find and display files to be deleted
-COUNT=0
-FILES_DELETED=0
-FILES_PRESERVED=0
 
 echo "Scanning: $MEDIA_INBOX"
 
-# Get files older than $DAYS
-while IFS= read -r file; do
-  if [[ "$DRY_RUN" = true ]]; then
-    ((COUNT++))
-    echo "Would delete: $file"
-  else
-    # Check if current user has read/write permissions
-    if [[ -r "$file" && -w "$file" ]]; then
-      rm "$file"
-      echo "Deleted: $file"
-      ((FILES_DELETED++))
-    else
-      echo "SKIPPED (permissions): $file"
-      ((FILES_PRESERVED++))
-    fi
-  fi
-done < <(find "$MEDIA_INBOX" -type f \( -name "*.ogg" -o -name "*.mp3" -o -name "*.wav" -o -name "*.mp4" -o -name "*.mov" -o -name "*.png" -o -name "*.jpg" -o -name "*.jpeg" -o -name "*.pdf" \) -mtime +$DAYS 2>/dev/null || true)
+#######################################
+# Process files
+#######################################
+while IFS= read -r -d '' file; do
+  ((++MATCHED))
 
+  if [[ "$DRY_RUN" == true ]]; then
+    echo "Would delete: $file"
+    continue
+  fi
+
+  if rm -- "$file"; then
+    echo "Deleted: $file"
+    ((++DELETED))
+  else
+    echo "FAILED: $file"
+    ((++FAILED))
+  fi
+
+done < <(
+  find "$MEDIA_INBOX" -type f \
+    \( \
+      -iname "*.ogg"  -o \
+      -iname "*.mp3"  -o \
+      -iname "*.wav"  -o \
+      -iname "*.mp4"  -o \
+      -iname "*.mov"  -o \
+      -iname "*.png"  -o \
+      -iname "*.jpg"  -o \
+      -iname "*.jpeg" -o \
+      -iname "*.pdf" \
+    \) \
+    -mtime +"$DAYS" \
+    -print0
+)
+
+#######################################
 # Summary
-echo ""
+#######################################
+echo
 echo "=== SUMMARY ==="
-if [[ "$DRY_RUN" = true ]]; then
-  echo "Would delete $COUNT file(s)"
+
+if [[ "$DRY_RUN" == true ]]; then
+  echo "Would delete: $MATCHED file(s)"
 else
-  echo "Deleted: $FILES_DELETED file(s)"
-  echo "Preserved: $FILES_PRESERVED file(s)"
+  echo "Matched : $MATCHED file(s)"
+  echo "Deleted : $DELETED file(s)"
+  echo "Failed  : $FAILED file(s)"
 fi
-echo "Files older than $DAYS days from: $MEDIA_INBOX"
+
+echo "Folder: $MEDIA_INBOX"
+echo "Done."
